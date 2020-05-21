@@ -26,40 +26,59 @@ name: Fetch upstream LinuxCNC repository and reset tracking branches to current 
 on:
   schedule:
       - cron: '*/15 * * * *'
-
+  push:
+    branches:
+      - 'machinekit/master'
 
 jobs:
   fetchAndReset:
     name: Fetch upstream and reset local tracking branches
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        branch: [master]
 
     steps:
+    - name: Show GitHub context as a JSON
+      run: |
+        echo "$GITHUB_CONTEXT"
+      env:
+        GITHUB_CONTEXT: ${{ toJson(github) }}
+
     - name: Clone EMCApplication repository
       uses: actions/checkout@v2
       with:
         path: linuxcnc
-        fetch-depth: 0
     
-    - name: Fetch LinuxCNC@master branch from EMCApplication
+    - name: Fetch LinuxCNC@${{ matrix.branch }} branch from EMCApplication
       run: |
         git fetch --no-tags origin \
-          +refs/heads/linuxcnc/master:refs/remotes/origin/linuxcnc/master
+          +refs/heads/linuxcnc/${{ matrix.branch }}:refs/remotes/origin/linuxcnc/${{ matrix.branch }}
       working-directory: ./linuxcnc
 
-    - name: Fetch LinuxCNC@master branch from upstream repository
+    - name: Fetch LinuxCNC@${{ matrix.branch }} branch from upstream repository
       env:
         LINUXCNC_REMOTE: 'https://github.com/LinuxCNC/linuxcnc.git'
       run: |
         git fetch --no-tags ${LINUXCNC_REMOTE} \
-          +refs/heads/master:refs/remotes/upstream/linuxcnc/master
+          +refs/heads/${{ matrix.branch }}:refs/remotes/upstream/linuxcnc/${{ matrix.branch }}
+      working-directory: ./linuxcnc
+
+    - name: Export branch information
+      id: branch_information
+      run: |
+        LOCAL_REV=$(git rev-parse refs/remotes/origin/linuxcnc/${{ matrix.branch }})
+        REMOTE_REV=$(git rev-parse refs/remotes/upstream/linuxcnc/${{ matrix.branch }})
+        echo "::set-output name=local_rev::$LOCAL_REV"
+        echo "::set-output name=remote_rev::$REMOTE_REV"
       working-directory: ./linuxcnc
 
     - name: Determine if upstream repository has changed
       id: head_difference_checker
+      env:
+        LOCAL_REV: ${{ steps.branch_information.outputs.local_rev }}
+        REMOTE_REV: ${{ steps.branch_information.outputs.remote_rev }}
       run: |
-        LOCAL_REV=$(git rev-parse refs/remotes/origin/linuxcnc/master)
-        REMOTE_REV=$(git rev-parse refs/remotes/upstream/linuxcnc/master)
-        echo "$LOCAL_REV $REMOTE_REV"
         if [[ "$LOCAL_REV" != "$REMOTE_REV" ]]
         then
           printf "HEAD commits not the same\n"
@@ -70,12 +89,165 @@ jobs:
         fi
       working-directory: ./linuxcnc
 
-    - name: Check if fast forward merge is possible
-      id: fast_forward_checker
+    - name: Check tests status on LinuxCNC's buildbot
+      id: buildbot_checker
       if: steps.head_difference_checker.outputs.same_head == 'false'
+      env:
+        GIT_BRANCH: ${{ matrix.branch }}
+        GIT_SHA: ${{ steps.branch_information.outputs.remote_rev }}
       run: |
-        LOCAL_REV=$(git rev-parse refs/remotes/origin/linuxcnc/master)
-        REMOTE_REV=$(git rev-parse refs/remotes/upstream/linuxcnc/master)
+        # This script is working around few issues specific to LinuxCNC's
+        # buildbot hosted at buildbot.linuxcnc.org, it should not be taked 
+        # as general abstraction for access to test results on all buildbots
+        CONFIG_JSON='
+        {
+           "buildersAllowedToSkip":{
+              "master":[
+                 "4003.deb-lucid-i386",
+                 "4004.deb-lucid-amd64",
+                 "4006.deb-lucid-rtai-i386"
+              ],
+              "2.8":[
+                 "4003.deb-lucid-i386",
+                 "4004.deb-lucid-amd64",
+                 "4006.deb-lucid-rtai-i386"
+              ],
+              "2.7":[
+                 "4040.deb-buster-rtpreempt-i386",
+                 "4041.deb-buster-rtpreempt-amd64",
+                 "4042.deb-buster-rtpreempt-rpi4"
+              ]
+           },
+           "searchDepth": 100
+        }'
+        BASE_ADDRESS="http://buildbot.linuxcnc.org/buildbot/json"
+        BUILDERS_ADDRESS="${BASE_ADDRESS}/builders"
+        JSON_BUILDERS=$(curl --silent "${BUILDERS_ADDRESS}")
+        if ! ( jq . >/dev/null 2>&1 <<<"${JSON_BUILDERS}" )
+        then
+            printf "Could not get builders from address %s\nABORTING\n" \
+              "$BUILDERS_ADDRESS"
+            exit 3
+        fi
+        BUILDERS_CACHE=$(echo "$JSON_BUILDERS" | \
+          jq 'to_entries[] | {builder: .key}' | jq -s '.')
+        BUILDERS_LENGTH=$(echo "$BUILDERS_CACHE" | jq '. | length')
+        readarray -t buildersToSkip < <(echo "$CONFIG_JSON" | jq -c -r -e --arg \
+            GitBranch "$GIT_BRANCH" '.buildersAllowedToSkip[$GitBranch] | .[]')
+        for (( i=0; i < BUILDERS_LENGTH; i++ ))
+        do
+            BUILD_HIT="FALSE"
+            BUILD_FAILURE="UNKNOWN"
+            BUILDER_NAME=$(echo "$BUILDERS_CACHE" | \
+                jq -r --arg I "$i" '.[$I|tonumber] | .builder')
+            if [[ "${buildersToSkip[@]}" =~ "${BUILDER_NAME}" ]]
+            then
+                printf "SKIPPING builder %s\n" "$BUILDER_NAME"
+                continue
+            fi
+            TESTED_INDEX=0
+            BUILDERS_BUILDS_ADDRESS="${BUILDERS_ADDRESS}/${BUILDER_NAME}/builds"
+            ALL_BUILDERS_BUILDS_ADDRESS="${BUILDERS_BUILDS_ADDRESS}/_all"
+            ALL_CACHED_BUILDS=$(curl --silent "${ALL_BUILDERS_BUILDS_ADDRESS}")
+            if ( jq -e . >/dev/null 2>&1 <<<"$ALL_CACHED_BUILDS" )
+            then
+                ALL_BUILDS=$(echo "$ALL_CACHED_BUILDS" | \
+                    jq 'to_entries[] | {buildNumber: .key, 
+                    branch: .value.sourceStamps[0].branch,
+                    gitSHA: .value.sourceStamps[0].revision, 
+                    results: .value.results}' | \
+                    jq -s '.')
+                BUILD_RESULT=$(echo "$ALL_BUILDS" | \
+                    jq -r --arg GitSHA "$GIT_SHA" '.[] | 
+                        select(.gitSHA==$GitSHA) |
+                        .results')
+                BUILD_NUMBER=$(echo "$ALL_BUILDS" | \
+                    jq -r --arg GitSHA "$GIT_SHA" '.[] |
+                        select(.gitSHA==$GitSHA) |
+                        .buildNumber')
+                if [ -n "$BUILD_NUMBER"  -a  -n "$BUILD_RESULT" ]
+                then
+                    BUILD_HIT="TRUE"
+                    if (( BUILD_RESULT < 2 ))
+                    then
+                        BUILD_FAILURE="FALSE"
+                    else
+                        BUILD_FAILURE="TRUE"
+                    fi
+                fi
+                TESTED_INDEX=$(echo "$ALL_CACHED_BUILDS" | jq '. | length')
+            fi
+            if [ "$BUILD_HIT" == "FALSE" ]
+            then
+                MAX_DEPTH=$(echo "$CONFIG_JSON" | jq -c -r '.searchDepth')
+                for (( TESTED_INDEX=-TESTED_INDEX - 1;
+                       TESTED_INDEX >=-MAX_DEPTH;
+                       TESTED_INDEX-- ))
+                do
+                    BUILDERS_BUILD_ADDRESS="${BUILDERS_BUILDS_ADDRESS}/$TESTED_INDEX"
+                    BUILD_DETAIL_JSON=$(curl --silent "${BUILDERS_BUILD_ADDRESS}")
+                    if ! ( jq . >/dev/null 2>&1 <<<"$BUILD_DETAIL_JSON" )
+                    then
+                        break
+                    fi
+                    GOTTEN_SHA=$(echo "$BUILD_DETAIL_JSON" | \
+                      jq -r '.sourceStamps[0].revision')
+                    if [[ "$GOTTEN_SHA" == "$GIT_SHA" ]]
+                    then
+                        BUILD_RESULT=$(echo "$BUILD_DETAIL_JSON" |  \
+                          jq -r -e '.results')
+                        BUILD_NUMBER=$(echo "$BUILD_DETAIL_JSON" |  \
+                          jq -r -e '.number')
+                        BUILD_HIT="TRUE"
+                        if (( BUILD_RESULT < 2 ))
+                        then
+                            BUILD_FAILURE="FALSE"
+                        else
+                            BUILD_FAILURE="TRUE"
+                        fi
+                        break
+                    fi
+                done
+            fi
+            if [ "$BUILD_HIT" == "FALSE" ]
+            then
+                FAILURE="TRUE"
+                printf "BUILD NOT FOUND ON BUILDER %s\n" "$BUILDER_NAME"
+            elif [ "$BUILD_FAILURE" == "TRUE" ]
+            then
+                FAILURE="TRUE"
+                printf "BUILD STATUS: %s -> FAILURE ON BUILD %s ON BUILDER %s\n" \
+                "$BUILD_RESULT" "$BUILD_NUMBER" "$BUILDER_NAME"
+            else
+            printf "BUILD STATUS: %s ON BUILD %s ON BUILDER %s\n" \
+                "$BUILD_RESULT" "$BUILD_NUMBER" "$BUILDER_NAME"
+            fi
+        done
+        if [ "$FAILURE" == "TRUE" ]
+        then
+            printf "Check for %s on buildbot failed\n" "$GIT_SHA" 
+            echo "::set-output name=failure::true"
+        else
+            printf "Check for %s on buildbot succeeded\n" "$GIT_SHA" 
+            echo "::set-output name=failure::false"
+        fi
+    
+    - name: Publish notification message in case buildbot tests failed
+      if: steps.buildbot_checker.outputs.failure == 'true'
+      uses: cstuder/apprise-ga@master
+      with:
+        title: "LinuxCNC's buildbot failure in repository ${{ github.repository }}"
+        message: "There was a failure when querying the buildbot for Git SHA ${{ steps.branch_information.outputs.remote_rev }} on branch ${{ matrix.branch }} - https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      env:
+        APPRISE_URL: ${{ secrets.MATRIX_APPRISE_URL }}
+
+    - name: Check if fast forward merge is possible on branch ${{ matrix.branch }}
+      id: fast_forward_checker
+      if: steps.buildbot_checker.outputs.failure == 'false'
+      env:
+        LOCAL_REV: ${{ steps.branch_information.outputs.local_rev }}
+        REMOTE_REV: ${{ steps.branch_information.outputs.remote_rev }}
+      run: |
         if git merge-base --is-ancestor ${LOCAL_REV} ${REMOTE_REV}
         then
           echo "Can be fast forwarded"
@@ -86,10 +258,29 @@ jobs:
         fi
       working-directory: ./linuxcnc
 
-    - name: Fast-forward branch
-      if: steps.head_difference_checker.outputs.same_head == 'false' && steps.fast_forward_checker.outputs.fast_forward_possible == 'true'
+    - name: Publish notification message in case fast-forward merge not possible
+      if: steps.fast_forward_checker.outputs.fast_forward_possible == 'false'
+      uses: cstuder/apprise-ga@master
+      with:
+        title: "LinuxCNC history change on branch ${{ matrix.branch }} in repository ${{ github.repository }}"
+        message: "Cannot fast-forward to Git SHA ${{ steps.branch_information.outputs.remote_rev }} from Git SHA ${{ steps.branch_information.outputs.local_rev }} - https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+      env:
+        APPRISE_URL: ${{ secrets.MATRIX_APPRISE_URL }}
+
+    - name: Fast-forward branch ${{ matrix.branch }} to upstream HEAD
+      if: steps.fast_forward_checker.outputs.fast_forward_possible == 'true'
       run: |
-        git checkout -b linuxcnc/master refs/remotes/origin/linuxcnc/master
-        git merge --ff-only refs/remotes/upstream/linuxcnc/master
-        git push origin refs/heads/linuxcnc/master
+        git checkout -b linuxcnc/${{ matrix.branch }} \
+          refs/remotes/origin/linuxcnc/${{ matrix.branch }}
+        git merge --ff-only refs/remotes/upstream/linuxcnc/${{ matrix.branch }}
+        git push origin refs/heads/linuxcnc/${{ matrix.branch }}
+      working-directory: ./linuxcnc
+
+    - name: Reset branch ${{ matrix.branch }} to upstream HEAD
+      if: steps.fast_forward_checker.outputs.fast_forward_possible == 'false'
+      run: |
+        git checkout -b linuxcnc/${{ matrix.branch }} \
+          refs/remotes/origin/linuxcnc/${{ matrix.branch }}
+        git reset --hard refs/remotes/upstream/linuxcnc/${{ matrix.branch }}
+        git push origin refs/heads/linuxcnc/${{ matrix.branch }} --force
       working-directory: ./linuxcnc
