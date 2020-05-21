@@ -1,0 +1,95 @@
+#####################################################################
+# Description:  fetch-and-reset-upstream-workflow.yaml
+#
+#               This file, 'fetch-and-reset-upstream-workflow.yaml', implements
+#               the automatic update of tracking branches
+#
+# Copyright (C) 2020       Jakub Fišer <jakub DOT fiser AT eryaf DOT com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+#
+######################################################################
+name: Fetch upstream LinuxCNC repository and reset tracking branches to current HEAD
+
+on:
+  schedule:
+      - cron: '*/15 * * * *'
+
+
+jobs:
+  fetchAndReset:
+    name: Fetch upstream and reset local tracking branches
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Clone EMCApplication repository
+      uses: actions/checkout@v2
+      with:
+        path: linuxcnc
+        fetch-depth: 0
+    
+    - name: Fetch LinuxCNC@master branch from EMCApplication
+      run: |
+        git fetch --no-tags origin \
+          +refs/heads/linuxcnc/master:refs/remotes/origin/linuxcnc/master
+      working-directory: ./linuxcnc
+
+    - name: Fetch LinuxCNC@master branch from upstream repository
+      env:
+        LINUXCNC_REMOTE: 'https://github.com/LinuxCNC/linuxcnc.git'
+      run: |
+        git fetch --no-tags ${LINUXCNC_REMOTE} \
+          +refs/heads/master:refs/remotes/upstream/linuxcnc/master
+      working-directory: ./linuxcnc
+
+    - name: Determine if upstream repository has changed
+      id: head_difference_checker
+      run: |
+        LOCAL_REV=$(git rev-parse refs/remotes/origin/linuxcnc/master)
+        REMOTE_REV=$(git rev-parse refs/remotes/upstream/linuxcnc/master)
+        echo "$LOCAL_REV $REMOTE_REV"
+        if [[ "$LOCAL_REV" != "$REMOTE_REV" ]]
+        then
+          printf "HEAD commits not the same\n"
+          echo "::set-output name=same_head::false"
+        else
+          printf "No difference in commits found\n"
+          echo "::set-output name=same_head::true"
+        fi
+      working-directory: ./linuxcnc
+
+    - name: Check if fast forward merge is possible
+      id: fast_forward_checker
+      if: steps.head_difference_checker.outputs.same_head == 'false'
+      run: |
+        LOCAL_REV=$(git rev-parse refs/remotes/origin/linuxcnc/master)
+        REMOTE_REV=$(git rev-parse refs/remotes/upstream/linuxcnc/master)
+        if git merge-base --is-ancestor ${LOCAL_REV} ${REMOTE_REV}
+        then
+          echo "Can be fast forwarded"
+          echo "::set-output name=fast_forward_possible::true"
+        else
+          echo "Cannot be fast-forwarded"
+          echo "::set-output name=fast_forward_possible::false"
+        fi
+      working-directory: ./linuxcnc
+
+    - name: Fast-forward branch
+      if: steps.head_difference_checker.outputs.same_head == 'false' && steps.fast_forward_checker.outputs.fast_forward_possible == 'true'
+      run: |
+        git checkout -b linuxcnc/master refs/remotes/origin/linuxcnc/master
+        git merge --ff-only refs/remotes/upstream/linuxcnc/master
+        git push origin refs/heads/linuxcnc/master
+      working-directory: ./linuxcnc
